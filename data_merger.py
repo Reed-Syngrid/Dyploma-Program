@@ -36,6 +36,9 @@ def merge_datasets(output_dir: str | Path) -> pd.DataFrame:
             raise ValueError(f"{label}_processed.csv must use resistance_ratio, not internal_resistance_ohm")
         if "resistance_ratio" not in frame.columns:
             raise ValueError(f"{label}_processed.csv is missing resistance_ratio")
+        for req in ("nominal_capacity", "form_factor"):
+            if req not in frame.columns:
+                raise ValueError(f"{label}_processed.csv is missing {req}")
     nasa["dataset_source"] = "NASA"
     oxford["dataset_source"] = "OXFORD"
     warwick["dataset_source"] = "WARWICK"

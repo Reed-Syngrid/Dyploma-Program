@@ -17,6 +17,8 @@ import numpy as np
 import pandas as pd
 
 NOMINAL_CAPACITY_AH: float = 2.9
+NOMINAL_CAPACITY_META_AH: float = 4.85
+FORM_FACTOR: int = 1
 DEFAULT_TEMP_C: float = 25.0
 # Drop spurious short discharge pulses; if multiple remain, keep the largest-capacity segment per file.
 MIN_SEGMENT_CAPACITY_AH: float = 0.15
@@ -28,6 +30,8 @@ RESULT_COLUMNS: tuple[str, ...] = (
     "avg_temperature_c",
     "resistance_ratio",
     "capacity_ah",
+    "nominal_capacity",
+    "form_factor",
     "soh_percentage",
 )
 
@@ -288,6 +292,8 @@ class WarwickBatteryParser:
         )
         out = out.drop(columns=["internal_resistance_ohm"])
         out["dataset_source"] = "Warwick"
+        out["nominal_capacity"] = NOMINAL_CAPACITY_META_AH
+        out["form_factor"] = FORM_FACTOR
         out = out[list(RESULT_COLUMNS)]
         return out.reset_index(drop=True)
 
@@ -313,3 +319,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

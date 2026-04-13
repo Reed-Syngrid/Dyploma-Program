@@ -19,6 +19,7 @@ from scipy.io import loadmat
 
 NOMINAL_CAPACITY_AH: float = 0.74
 DCIR_PROXY_CURRENT_A: float = 0.74
+FORM_FACTOR: int = 0
 
 RESULT_COLUMNS: tuple[str, ...] = (
     "dataset_source",
@@ -27,6 +28,8 @@ RESULT_COLUMNS: tuple[str, ...] = (
     "avg_temperature_c",
     "resistance_ratio",
     "capacity_ah",
+    "nominal_capacity",
+    "form_factor",
     "soh_percentage",
 )
 
@@ -207,6 +210,8 @@ class OxfordBatteryParser:
         r0 = out_df.groupby("battery_id", sort=False)["internal_resistance_ohm"].transform("first")
         out_df["resistance_ratio"] = out_df["internal_resistance_ohm"] / r0.replace(0.0, np.nan)
         out_df = out_df.drop(columns=["internal_resistance_ohm"])
+        out_df["nominal_capacity"] = NOMINAL_CAPACITY_AH
+        out_df["form_factor"] = FORM_FACTOR
         out_df = out_df[list(RESULT_COLUMNS)]
         return out_df
 
@@ -228,3 +233,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

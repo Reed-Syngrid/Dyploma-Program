@@ -16,6 +16,7 @@ import pandas as pd
 from scipy.io import loadmat
 
 NOMINAL_CAPACITY_AH: float = 2.0
+FORM_FACTOR: int = 1
 
 RESULT_COLUMNS: tuple[str, ...] = (
     "battery_id",
@@ -23,6 +24,8 @@ RESULT_COLUMNS: tuple[str, ...] = (
     "avg_temperature_c",
     "resistance_ratio",
     "capacity_ah",
+    "nominal_capacity",
+    "form_factor",
     "soh_percentage",
 )
 
@@ -262,6 +265,8 @@ class NASABatteryParser:
         r0 = df.groupby("battery_id", sort=False)["internal_resistance_ohm"].transform("first")
         df["resistance_ratio"] = df["internal_resistance_ohm"] / r0.replace(0.0, np.nan)
         df = df.drop(columns=["internal_resistance_ohm"])
+        df["nominal_capacity"] = NOMINAL_CAPACITY_AH
+        df["form_factor"] = FORM_FACTOR
         return df[list(RESULT_COLUMNS)]
 
 
@@ -281,3 +286,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
