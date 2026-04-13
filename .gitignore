@@ -1,0 +1,6 @@
+OXFORD_RAW/
+NASA_RAW/
+WARWICK_RAW/
+output/
+*.png
+__pycache__/
