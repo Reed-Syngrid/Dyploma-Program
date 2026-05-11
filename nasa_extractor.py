@@ -26,6 +26,8 @@ RESULT_COLUMNS: tuple[str, ...] = (
     "capacity_ah",
     "nominal_capacity",
     "form_factor",
+    "temp_variance",
+    "voltage_variance",
     "soh_percentage",
 )
 
@@ -128,6 +130,34 @@ def _extract_temperature_mean_c(data_struct: np.void) -> float | None:
         if arr.size == 0:
             return None
     return float(np.mean(arr))
+
+
+def _finite_array_from_field(data_struct: np.void, field: str) -> np.ndarray | None:
+    names = data_struct.dtype.names
+    if names is None or field not in names:
+        return None
+    arr = _unwrap_to_float_array(data_struct[field])
+    if arr is None or arr.size == 0:
+        return None
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return None
+    return arr
+
+
+def _temperature_variance_discharge(data_struct: np.void) -> float | None:
+    arr = _finite_array_from_field(data_struct, "Temperature_measured")
+    if arr is None:
+        return None
+    return float(np.var(arr))
+
+
+def _voltage_variance_discharge(data_struct: np.void) -> float | None:
+    for field in ("Voltage_measured", "Voltage"):
+        arr = _finite_array_from_field(data_struct, field)
+        if arr is not None:
+            return float(np.var(arr))
+    return None
 
 
 def _unwrap_to_float_array(obj: object) -> np.ndarray | None:
@@ -234,9 +264,13 @@ class NASABatteryParser:
 
                 cap = _extract_discharge_capacity_ah(ds)
                 avg_temp = _extract_temperature_mean_c(ds)
+                tv = _temperature_variance_discharge(ds)
+                vv = _voltage_variance_discharge(ds)
                 if cap is None or avg_temp is None:
                     continue
                 if not np.isfinite(cap) or not np.isfinite(avg_temp):
+                    continue
+                if tv is None or vv is None or not np.isfinite(tv) or not np.isfinite(vv):
                     continue
 
                 discharge_counter += 1
@@ -248,6 +282,8 @@ class NASABatteryParser:
                         "avg_temperature_c": avg_temp,
                         "internal_resistance_ohm": current_resistance,
                         "capacity_ah": cap,
+                        "temp_variance": tv,
+                        "voltage_variance": vv,
                         "soh_percentage": soh,
                     }
                 )

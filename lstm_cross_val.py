@@ -1,5 +1,5 @@
 """
-LSTM few-shot transfer validation: train on NASA + Warwick + 2 Oxford cells, test on remaining Oxford.
+LSTM transfer learning: pre-train on NASA + Warwick, fine-tune on 2 Oxford cells, test on held-out Oxford.
 """
 
 from __future__ import annotations
@@ -13,37 +13,82 @@ import torch
 import torch.nn as nn
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.preprocessing import MinMaxScaler
+from torch.utils.data import DataLoader, TensorDataset
 
+# Inputs: temporal embedding + electro-physical state + degradation velocities (per-battery diffs).
 FEATURE_COLUMNS: list[str] = [
+    "discharge_cycle",
     "avg_temperature_c",
     "resistance_ratio",
     "nominal_capacity",
     "form_factor",
+    "temp_variance",
+    "voltage_variance",
+    "resistance_velocity",
+    "temp_var_velocity",
+]
+
+# Columns that must be present in MASTER before velocity features are derived.
+_BASE_FEATURE_COLS: list[str] = [
+    "avg_temperature_c",
+    "resistance_ratio",
+    "nominal_capacity",
+    "form_factor",
+    "temp_variance",
+    "voltage_variance",
 ]
 TARGET_COLUMN: str = "soh_percentage"
 WINDOW_SIZE: int = 10
-EPOCHS: int = 30
-LEARNING_RATE: float = 0.01
+TARGET_HORIZON: int = 20
+BATCH_SIZE: int = 64
+
+PRETRAIN_EPOCHS: int = 150
+PRETRAIN_LR: float = 0.001
+FINETUNE_EPOCHS: int = 50
+FINETUNE_LR: float = 0.0001
 
 
-def create_sequences(df: pd.DataFrame, window_size: int = 10) -> tuple[np.ndarray, np.ndarray]:
+def _add_degradation_velocity(df: pd.DataFrame) -> pd.DataFrame:
+    """First differences of physical features within each battery (sorted by discharge_cycle)."""
+    out = df.sort_values(["battery_id", "discharge_cycle"], kind="mergesort").copy()
+    gb = out.groupby("battery_id", sort=False)
+    out["resistance_velocity"] = gb["resistance_ratio"].diff().fillna(0.0)
+    out["temp_var_velocity"] = gb["temp_variance"].diff().fillna(0.0)
+    return out
+
+
+def create_sequences(
+    df: pd.DataFrame, window_size: int = 10, horizon: int = TARGET_HORIZON
+) -> tuple[np.ndarray, np.ndarray]:
     """
     Group by battery_id and create rolling windows.
-    Target is the last row's soh_percentage inside each window.
+    Target is ``soh_percentage`` at index ``i + window_size + horizon`` (lookahead in the sorted series).
+    Drops windows without enough future rows or with a gap (``discharge_cycle`` step > 1) along the path
+    from ``i`` through ``i + window_size + horizon``.
+    Uses ``_dc_orig`` (pre-scale cycle index) for gap detection when present; else ``discharge_cycle``.
     """
     x_list: list[np.ndarray] = []
     y_list: list[float] = []
+
+    dc_col = "_dc_orig" if "_dc_orig" in df.columns else "discharge_cycle"
+    span = window_size + horizon
 
     for _, group in df.groupby("battery_id", sort=True):
         g = group.sort_values("discharge_cycle", kind="mergesort")
         x = g[FEATURE_COLUMNS].to_numpy(dtype=np.float32)
         y = g[TARGET_COLUMN].to_numpy(dtype=np.float32)
-        if len(g) < window_size:
+        dc = g[dc_col].to_numpy(dtype=np.float64)
+        if len(g) < span + 1:
             continue
-        for i in range(len(g) - window_size + 1):
+        for i in range(len(g) - span):
+            path_dc = dc[i : i + span + 1]
+            if path_dc.size != span + 1:
+                continue
+            if np.any(np.diff(path_dc) > 1):
+                continue
             j = i + window_size
             x_list.append(x[i:j])
-            y_list.append(float(y[j - 1]))
+            y_list.append(float(y[i + span]))
 
     if not x_list:
         return (
@@ -55,13 +100,20 @@ def create_sequences(df: pd.DataFrame, window_size: int = 10) -> tuple[np.ndarra
 
 
 class LSTMRegressor(nn.Module):
-    def __init__(self, input_size: int = 4, hidden_size: int = 32, num_layers: int = 1) -> None:
+    def __init__(
+        self,
+        input_size: int = 9,
+        hidden_size: int = 64,
+        num_layers: int = 2,
+        dropout: float = 0.2,
+    ) -> None:
         super().__init__()
         self.lstm = nn.LSTM(
             input_size=input_size,
             hidden_size=hidden_size,
             num_layers=num_layers,
             batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0,
         )
         self.fc = nn.Linear(hidden_size, 1)
 
@@ -72,20 +124,47 @@ class LSTMRegressor(nn.Module):
         return pred
 
 
+def _run_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    criterion: nn.Module,
+    optimizer: torch.optim.Optimizer | None,
+) -> float:
+    train_mode = optimizer is not None
+    if train_mode:
+        model.train()
+    else:
+        model.eval()
+    total_loss = 0.0
+    n = 0
+    ctx = torch.enable_grad() if train_mode else torch.no_grad()
+    with ctx:
+        for xb, yb in loader:
+            if train_mode:
+                optimizer.zero_grad()
+            pred = model(xb)
+            loss = criterion(pred, yb)
+            if train_mode:
+                loss.backward()
+                optimizer.step()
+            total_loss += float(loss.item()) * xb.size(0)
+            n += xb.size(0)
+    return total_loss / max(n, 1)
+
+
 def main() -> None:
     root = Path(__file__).resolve().parent
     master_path = root / "output" / "MASTER_processed.csv"
     df = pd.read_csv(master_path).copy()
 
     src = df["dataset_source"].astype(str).str.upper()
-    warwick_mask = src == "WARWICK"
-    df.loc[warwick_mask, TARGET_COLUMN] = (df.loc[warwick_mask, "capacity_ah"] / 4.85) * 100.0
 
     oxford_df = df[src == "OXFORD"].copy()
     oxford_ids = sorted(oxford_df["battery_id"].dropna().unique().tolist())
     if len(oxford_ids) < 3:
         raise RuntimeError("Need at least 3 Oxford batteries for 2-shot adaptation + held-out test.")
-    adapt_ids = oxford_ids[:2]
+    min_soh_by_cell = oxford_df.groupby("battery_id", sort=False)["soh_percentage"].min()
+    adapt_ids = min_soh_by_cell.nsmallest(2).index.astype(str).tolist()
 
     df_train = pd.concat(
         [
@@ -96,9 +175,19 @@ def main() -> None:
     )
     df_test = oxford_df[~oxford_df["battery_id"].isin(adapt_ids)].copy()
 
-    required = FEATURE_COLUMNS + [TARGET_COLUMN, "battery_id", "discharge_cycle"]
+    required = _BASE_FEATURE_COLS + [TARGET_COLUMN, "battery_id", "discharge_cycle"]
     df_train = df_train.dropna(subset=required)
     df_test = df_test.dropna(subset=required)
+
+    df_train = _add_degradation_velocity(df_train)
+    df_test = _add_degradation_velocity(df_test)
+
+    df_train["_dc_orig"] = df_train["discharge_cycle"].astype(np.float64)
+    df_test["_dc_orig"] = df_test["discharge_cycle"].astype(np.float64)
+
+    for col in FEATURE_COLUMNS:
+        df_train[col] = df_train[col].astype(np.float64)
+        df_test[col] = df_test[col].astype(np.float64)
 
     scaler = MinMaxScaler()
     df_train.loc[:, FEATURE_COLUMNS] = scaler.fit_transform(df_train[FEATURE_COLUMNS])
@@ -108,35 +197,63 @@ def main() -> None:
     df_train.loc[:, [TARGET_COLUMN]] = target_scaler.fit_transform(df_train[[TARGET_COLUMN]])
     df_test.loc[:, [TARGET_COLUMN]] = target_scaler.transform(df_test[[TARGET_COLUMN]])
 
-    X_train_np, y_train_np = create_sequences(df_train, window_size=WINDOW_SIZE)
+    src_tr = df_train["dataset_source"].astype(str).str.upper()
+    df_pretrain = df_train[src_tr.isin(("NASA", "WARWICK"))].copy()
+    df_finetune = df_train[(src_tr == "OXFORD") & (df_train["battery_id"].isin(adapt_ids))].copy()
+
+    X_pre_np, y_pre_np = create_sequences(df_pretrain, window_size=WINDOW_SIZE)
+    X_ft_np, y_ft_np = create_sequences(df_finetune, window_size=WINDOW_SIZE)
     X_test_np, y_test_np = create_sequences(df_test, window_size=WINDOW_SIZE)
 
-    if X_train_np.shape[0] == 0 or X_test_np.shape[0] == 0:
-        raise RuntimeError("No sequences created. Check window_size and input data.")
+    if X_pre_np.shape[0] == 0:
+        raise RuntimeError("No pre-train sequences (NASA + Warwick).")
+    if X_ft_np.shape[0] == 0:
+        raise RuntimeError("No fine-tune sequences (Oxford adaptation cells).")
+    if X_test_np.shape[0] == 0:
+        raise RuntimeError("No test sequences.")
 
-    X_train = torch.tensor(X_train_np, dtype=torch.float32)
-    y_train = torch.tensor(y_train_np, dtype=torch.float32)
+    X_pre = torch.tensor(X_pre_np, dtype=torch.float32)
+    y_pre = torch.tensor(y_pre_np, dtype=torch.float32)
+    X_ft = torch.tensor(X_ft_np, dtype=torch.float32)
+    y_ft = torch.tensor(y_ft_np, dtype=torch.float32)
     X_test = torch.tensor(X_test_np, dtype=torch.float32)
     y_test = torch.tensor(y_test_np, dtype=torch.float32)
 
-    model = LSTMRegressor(input_size=4, hidden_size=32, num_layers=1)
+    pre_loader = DataLoader(TensorDataset(X_pre, y_pre), batch_size=BATCH_SIZE, shuffle=True)
+    ft_loader = DataLoader(TensorDataset(X_ft, y_ft), batch_size=BATCH_SIZE, shuffle=True)
+
+    input_size = len(FEATURE_COLUMNS)
+    model = LSTMRegressor(input_size=input_size, hidden_size=64, num_layers=2, dropout=0.2)
     criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    optimizer_pre = torch.optim.Adam(model.parameters(), lr=PRETRAIN_LR)
 
-    model.train()
-    for epoch in range(EPOCHS):
-        optimizer.zero_grad()
-        pred = model(X_train)
-        loss = criterion(pred, y_train)
-        loss.backward()
-        optimizer.step()
-        if (epoch + 1) % 10 == 0 or epoch == 0:
-            print(f"Epoch {epoch + 1:02d}/{EPOCHS} - loss: {loss.item():.4f}")
+    print(f"Pre-training on NASA + Warwick only: {len(y_pre_np)} sequences, {PRETRAIN_EPOCHS} epochs")
+    for epoch in range(PRETRAIN_EPOCHS):
+        avg_loss = _run_epoch(model, pre_loader, criterion, optimizer_pre)
+        if epoch == 0 or (epoch + 1) % 30 == 0:
+            print(f"  Pre-train epoch {epoch + 1:03d}/{PRETRAIN_EPOCHS} - loss: {avg_loss:.4f}")
 
+    for p in model.lstm.parameters():
+        p.requires_grad = False
+    optimizer_ft = torch.optim.Adam(model.fc.parameters(), lr=FINETUNE_LR)
+
+    print(f"\nFine-tuning (frozen LSTM, head only) on Oxford adaptation cells: {len(y_ft_np)} sequences")
+    for epoch in range(FINETUNE_EPOCHS):
+        avg_loss = _run_epoch(model, ft_loader, criterion, optimizer_ft)
+        if epoch == 0 or (epoch + 1) % 10 == 0:
+            print(f"  Fine-tune epoch {epoch + 1:02d}/{FINETUNE_EPOCHS} - loss: {avg_loss:.4f}")
+
+    test_loader = DataLoader(TensorDataset(X_test, y_test), batch_size=BATCH_SIZE, shuffle=False)
     model.eval()
+    y_pred_chunks: list[np.ndarray] = []
+    y_true_chunks: list[np.ndarray] = []
     with torch.no_grad():
-        y_pred_scaled = model(X_test).cpu().numpy().reshape(-1, 1)
-    y_true_scaled = y_test.cpu().numpy().reshape(-1, 1)
+        for xb, yb in test_loader:
+            pb = model(xb).cpu().numpy()
+            y_pred_chunks.append(pb.reshape(-1, 1))
+            y_true_chunks.append(yb.cpu().numpy().reshape(-1, 1))
+    y_pred_scaled = np.concatenate(y_pred_chunks, axis=0)
+    y_true_scaled = np.concatenate(y_true_chunks, axis=0)
 
     y_pred = target_scaler.inverse_transform(y_pred_scaled).ravel()
     y_true = target_scaler.inverse_transform(y_true_scaled).ravel()
@@ -145,19 +262,21 @@ def main() -> None:
     mae = float(mean_absolute_error(y_true, y_pred))
     r2 = float(r2_score(y_true, y_pred))
 
-    print("\nLSTM few-shot transfer: train on NASA + Warwick + 2 Oxford cells")
+    print("\nLSTM transfer learning: pre-train NASA+Warwick -> fine-tune 2 Oxford -> test held-out Oxford")
     print(f"  Oxford adaptation batteries: {adapt_ids}")
-    print("  Test set: remaining Oxford batteries")
-    print(f"  Train sequences: {len(y_train_np)} | Test sequences: {len(y_test_np)}")
+    print(
+        f"  Pre-train sequences: {len(y_pre_np)} | Fine-tune sequences: {len(y_ft_np)} | "
+        f"Test sequences: {len(y_test_np)}"
+    )
     print(f"  RMSE: {rmse:.4f}")
     print(f"  MAE:  {mae:.4f}")
     print(f"  R^2:  {r2:.4f}")
 
     fig, ax = plt.subplots(figsize=(7, 7))
     ax.scatter(y_true, y_pred, alpha=0.15, s=8, edgecolors="none")
-    ax.set_xlabel("Actual SoH (Oxford) [%]")
-    ax.set_ylabel("Predicted SoH (LSTM few-shot transfer) [%]")
-    ax.set_title("LSTM NASA + Warwick + 2 Oxford cells -> held-out Oxford")
+    ax.set_xlabel("Actual SoH (Oxford held-out) [%]")
+    ax.set_ylabel("Predicted SoH (LSTM transfer) [%]")
+    ax.set_title("Pre-train NASA+Warwick, fine-tune 2 Oxford cells, test remaining Oxford")
     lo = float(min(np.min(y_true), np.min(y_pred)))
     hi = float(max(np.max(y_true), np.max(y_pred)))
     ax.plot([lo, hi], [lo, hi], "r--", linewidth=1.5, label="y = x (perfect)")

@@ -1,7 +1,7 @@
 """
 Triple-dataset cross-validation: train Random Forest on NASA + Warwick, evaluate on Oxford.
 
-Warwick SoH is re-scaled to a 4.85 Ah nominal before training so targets align with physical capacity.
+Warwick SoH is defined at extraction time in ``warwick_extractor.py`` (nominal 4.85 Ah).
 """
 
 from __future__ import annotations
@@ -21,7 +21,6 @@ FEATURE_COLUMNS: tuple[str, ...] = (
 TARGET_COLUMN: str = "soh_percentage"
 # Warwick rows in MASTER use tag ``WARWICK`` (see data_merger.py).
 WARWICK_SOURCE: str = "WARWICK"
-WARWICK_NOMINAL_AH: float = 4.85
 
 
 def main() -> None:
@@ -29,9 +28,6 @@ def main() -> None:
     master_path = root / "output" / "MASTER_processed.csv"
 
     df = pd.read_csv(master_path).copy()
-
-    w_mask = df["dataset_source"] == WARWICK_SOURCE
-    df.loc[w_mask, "soh_percentage"] = (df.loc[w_mask, "capacity_ah"] / WARWICK_NOMINAL_AH) * 100.0
 
     df_train = df[df["dataset_source"].isin(("NASA", WARWICK_SOURCE))].copy()
     df_test = df[df["dataset_source"] == "OXFORD"].copy()

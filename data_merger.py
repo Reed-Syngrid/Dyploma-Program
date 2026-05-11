@@ -29,6 +29,9 @@ def merge_datasets(output_dir: str | Path) -> pd.DataFrame:
     nasa = nasa.copy()
     oxford = oxford.copy()
     warwick = warwick.copy()
+    for _, frame in (("NASA", nasa), ("Oxford", oxford), ("Warwick", warwick)):
+        if "dataset_source" in frame.columns:
+            frame.drop(columns=["dataset_source"], inplace=True)
     if "cycle_index" in oxford.columns:
         oxford = oxford.rename(columns={"cycle_index": "discharge_cycle"})
     for label, frame in (("NASA", nasa), ("Oxford", oxford), ("Warwick", warwick)):
@@ -36,7 +39,7 @@ def merge_datasets(output_dir: str | Path) -> pd.DataFrame:
             raise ValueError(f"{label}_processed.csv must use resistance_ratio, not internal_resistance_ohm")
         if "resistance_ratio" not in frame.columns:
             raise ValueError(f"{label}_processed.csv is missing resistance_ratio")
-        for req in ("nominal_capacity", "form_factor"):
+        for req in ("nominal_capacity", "form_factor", "temp_variance", "voltage_variance"):
             if req not in frame.columns:
                 raise ValueError(f"{label}_processed.csv is missing {req}")
     nasa["dataset_source"] = "NASA"
@@ -44,6 +47,7 @@ def merge_datasets(output_dir: str | Path) -> pd.DataFrame:
     warwick["dataset_source"] = "WARWICK"
 
     master = pd.concat([nasa, oxford, warwick], ignore_index=True)
+    master["dataset_source"] = master["dataset_source"].astype(str).str.strip().str.upper()
     master.to_csv(master_path, index=False)
     return master
 

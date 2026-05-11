@@ -11,7 +11,7 @@ import pandas as pd
 import shap
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GroupShuffleSplit
 
 FEATURE_COLUMNS: tuple[str, ...] = (
     "discharge_cycle",
@@ -41,6 +41,7 @@ def fit_and_evaluate(
     X_test: pd.DataFrame | None = None,
     y_train: np.ndarray | None = None,
     y_test: np.ndarray | None = None,
+    groups: pd.Series | np.ndarray | None = None,
     test_size: float = 0.2,
     random_state: int = 42,
     n_estimators: int = 200,
@@ -49,7 +50,7 @@ def fit_and_evaluate(
     """
     Train a Random Forest on FEATURE_COLUMNS to predict TARGET_COLUMN.
 
-    **Random split:** pass ``df``; uses ``train_test_split``.
+    **Grouped split:** pass ``df``; uses ``GroupShuffleSplit`` on ``battery_id`` (no leakage across cells).
 
     **Holdout:** pass ``X_train``, ``X_test``, ``y_train``, ``y_test`` (e.g. NASA train / Oxford test).
     """
@@ -67,12 +68,16 @@ def fit_and_evaluate(
             raise TypeError("fit_and_evaluate requires df or X_train/X_test/y_train/y_test.")
         X = df.loc[:, list(FEATURE_COLUMNS)]
         y = df[TARGET_COLUMN].to_numpy()
-        X_tr, X_te, y_tr, y_te = train_test_split(
-            X,
-            y,
-            test_size=test_size,
-            random_state=random_state,
-        )
+        grp = groups if groups is not None else df.get("battery_id")
+        if grp is None:
+            raise ValueError("Grouped split requires battery_id in df or an explicit groups argument.")
+        grp_arr = np.asarray(grp)
+        splitter = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=random_state)
+        train_idx, test_idx = next(splitter.split(X, y, groups=grp_arr))
+        X_tr = X.iloc[train_idx]
+        X_te = X.iloc[test_idx]
+        y_tr = y[train_idx]
+        y_te = y[test_idx]
 
     model = RandomForestRegressor(
         n_estimators=n_estimators,

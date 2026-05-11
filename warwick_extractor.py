@@ -1,8 +1,8 @@
 """
 Warwick raw CSV logs (Maccor-style): discharge cycles, capacity, temperature, DCIR proxy, SoH.
 
-Nominal capacity **2.9 Ah** for SoH: ``(capacity_ah / 2.9) * 100``. Resistance is normalized per
-``battery_id`` as ``resistance_ratio`` (first valid R as R0).
+SoH uses **NOMINAL_CAPACITY_META_AH** (4.85 Ah) as the single nominal reference. Resistance is normalized
+per ``battery_id`` as ``resistance_ratio`` (first valid R as R0).
 """
 
 from __future__ import annotations
@@ -16,7 +16,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-NOMINAL_CAPACITY_AH: float = 2.9
 NOMINAL_CAPACITY_META_AH: float = 4.85
 FORM_FACTOR: int = 1
 DEFAULT_TEMP_C: float = 25.0
@@ -24,7 +23,6 @@ DEFAULT_TEMP_C: float = 25.0
 MIN_SEGMENT_CAPACITY_AH: float = 0.15
 
 RESULT_COLUMNS: tuple[str, ...] = (
-    "dataset_source",
     "battery_id",
     "discharge_cycle",
     "avg_temperature_c",
@@ -32,6 +30,8 @@ RESULT_COLUMNS: tuple[str, ...] = (
     "capacity_ah",
     "nominal_capacity",
     "form_factor",
+    "temp_variance",
+    "voltage_variance",
     "soh_percentage",
 )
 
@@ -212,8 +212,20 @@ def _rows_from_discharge_segments(
         if not np.isfinite(avg_t):
             avg_t = DEFAULT_TEMP_C
 
+        vv_ser = pd.to_numeric(seg[vcol], errors="coerce")
+        t_arr = tt.to_numpy(dtype=np.float64)
+        v_arr = vv_ser.to_numpy(dtype=np.float64)
+        t_arr = t_arr[np.isfinite(t_arr)]
+        v_arr = v_arr[np.isfinite(v_arr)]
+        if t_arr.size == 0 or v_arr.size == 0:
+            continue
+        temp_variance = float(np.var(t_arr))
+        voltage_variance = float(np.var(v_arr))
+        if not np.isfinite(temp_variance) or not np.isfinite(voltage_variance):
+            continue
+
         ir = _internal_resistance_ohm(seg, vcol, icol)
-        soh = (cap / NOMINAL_CAPACITY_AH) * 100.0
+        soh = (cap / NOMINAL_CAPACITY_META_AH) * 100.0
 
         if filename_cycle is not None:
             dc = filename_cycle if len(blocks) == 1 else filename_cycle * 1000 + seg_i
@@ -226,6 +238,8 @@ def _rows_from_discharge_segments(
                 "avg_temperature_c": avg_t,
                 "internal_resistance_ohm": ir,
                 "capacity_ah": cap,
+                "temp_variance": temp_variance,
+                "voltage_variance": voltage_variance,
                 "soh_percentage": soh,
             }
         )
@@ -244,7 +258,7 @@ class WarwickBatteryParser:
             raise FileNotFoundError(f"Directory not found: {self._csv_dir.resolve()}")
 
         paths = _dedupe_paths([p for p in self._csv_dir.rglob("*.csv") if p.is_file()])
-        rows_out: list[dict[str, float | int | str]] = []
+        rows_out: list[dict[str, float | int]] = []
         dc_fallback: defaultdict[str, int] = defaultdict(int)
 
         for path in paths:
@@ -291,7 +305,6 @@ class WarwickBatteryParser:
             0.0, np.nan
         )
         out = out.drop(columns=["internal_resistance_ohm"])
-        out["dataset_source"] = "Warwick"
         out["nominal_capacity"] = NOMINAL_CAPACITY_META_AH
         out["form_factor"] = FORM_FACTOR
         out = out[list(RESULT_COLUMNS)]

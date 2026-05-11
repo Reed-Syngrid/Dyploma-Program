@@ -22,7 +22,6 @@ DCIR_PROXY_CURRENT_A: float = 0.74
 FORM_FACTOR: int = 0
 
 RESULT_COLUMNS: tuple[str, ...] = (
-    "dataset_source",
     "battery_id",
     "cycle_index",
     "avg_temperature_c",
@@ -30,6 +29,8 @@ RESULT_COLUMNS: tuple[str, ...] = (
     "capacity_ah",
     "nominal_capacity",
     "form_factor",
+    "temp_variance",
+    "voltage_variance",
     "soh_percentage",
 )
 
@@ -168,6 +169,10 @@ class OxfordBatteryParser:
                     if not np.isfinite(internal_resistance_ohm):
                         continue
                     soh_percentage = (capacity_ah / NOMINAL_CAPACITY_AH) * 100.0
+                    temp_variance = float(np.var(T_arr))
+                    voltage_variance = float(np.var(v))
+                    if not np.isfinite(temp_variance) or not np.isfinite(voltage_variance):
+                        continue
                     rows.append(
                         {
                             "battery_id": battery_id,
@@ -175,6 +180,8 @@ class OxfordBatteryParser:
                             "avg_temperature_c": avg_temperature_c,
                             "internal_resistance_ohm": internal_resistance_ohm,
                             "capacity_ah": capacity_ah,
+                            "temp_variance": temp_variance,
+                            "voltage_variance": voltage_variance,
                             "soh_percentage": soh_percentage,
                         }
                     )
@@ -191,6 +198,8 @@ class OxfordBatteryParser:
             "soh_percentage",
             "avg_temperature_c",
             "internal_resistance_ohm",
+            "temp_variance",
+            "voltage_variance",
         ]
         for bid, g in df.groupby("battery_id", sort=True):
             g = g.sort_values("raw_cycle", kind="mergesort")
@@ -200,7 +209,6 @@ class OxfordBatteryParser:
             wide = wide.interpolate(method="linear").bfill()
             out = wide.reset_index(names="cycle_index")
             out.insert(0, "battery_id", bid)
-            out["dataset_source"] = "Oxford"
             dense_parts.append(out)
 
         out_df = pd.concat(dense_parts, ignore_index=True)
