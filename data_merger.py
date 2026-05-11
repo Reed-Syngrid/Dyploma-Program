@@ -15,6 +15,7 @@ def merge_datasets(output_dir: str | Path) -> pd.DataFrame:
     tag ``dataset_source``, concatenate, and save ``MASTER_processed.csv``.
 
     All three inputs use domain-normalized ``resistance_ratio`` (not absolute ohms).
+    Each row must include ``temp_variance`` and ``voltage_variance`` (per-discharge spread metrics).
     """
     out = Path(output_dir)
     nasa_path = out / "NASA_processed.csv"

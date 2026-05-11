@@ -28,6 +28,9 @@ FEATURE_COLUMNS: list[str] = [
     "temp_var_velocity",
 ]
 
+assert "discharge_cycle" in FEATURE_COLUMNS, "Temporal embedding: discharge_cycle must stay in FEATURE_COLUMNS."
+assert "resistance_velocity" in FEATURE_COLUMNS and "temp_var_velocity" in FEATURE_COLUMNS
+
 # Columns that must be present in MASTER before velocity features are derived.
 _BASE_FEATURE_COLS: list[str] = [
     "avg_temperature_c",
@@ -47,6 +50,11 @@ PRETRAIN_LR: float = 0.001
 FINETUNE_EPOCHS: int = 50
 FINETUNE_LR: float = 0.0001
 
+# Phase 22 — LSTM backbone (deep architecture)
+LSTM_HIDDEN_SIZE: int = 64
+LSTM_NUM_LAYERS: int = 2
+LSTM_DROPOUT: float = 0.2
+
 
 def _add_degradation_velocity(df: pd.DataFrame) -> pd.DataFrame:
     """First differences of physical features within each battery (sorted by discharge_cycle)."""
@@ -57,20 +65,41 @@ def _add_degradation_velocity(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _oxford_adaptation_battery_ids(oxford_df: pd.DataFrame, k: int = 2) -> list[str]:
+    """
+    Few-shot selection: ``k`` Oxford cells whose **minimum** observed ``soh_percentage`` is lowest
+    (deepest degradation trajectory). Tie-break on ``battery_id`` for reproducibility.
+    """
+    min_soh = (
+        oxford_df.groupby("battery_id", sort=False)["soh_percentage"]
+        .min()
+        .rename("min_soh")
+        .reset_index()
+    )
+    min_soh = min_soh.sort_values(["min_soh", "battery_id"], ascending=[True, True], kind="mergesort")
+    return min_soh.head(k)["battery_id"].astype(str).tolist()
+
+
 def create_sequences(
     df: pd.DataFrame, window_size: int = 10, horizon: int = TARGET_HORIZON
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Group by battery_id and create rolling windows.
-    Target is ``soh_percentage`` at index ``i + window_size + horizon`` (lookahead in the sorted series).
-    Drops windows without enough future rows or with a gap (``discharge_cycle`` step > 1) along the path
-    from ``i`` through ``i + window_size + horizon``.
-    Uses ``_dc_orig`` (pre-scale cycle index) for gap detection when present; else ``discharge_cycle``.
+    Group by ``battery_id`` and build sliding windows of length ``window_size``.
+
+    **Predictive horizon:** the target is **not** the SoH at the last timestep of the window, but the
+    SoH at **row index** ``i + window_size + horizon`` (with default ``horizon=20``, that is
+    ``i + window_size + 20``). Sequences that do not have enough future rows are dropped
+    (``len(group) < window_size + horizon + 1``).
+
+    **Time-gap protection:** along the row path ``i … i + window_size + horizon``, if any consecutive
+    ``discharge_cycle`` step is strictly greater than 1, the window is discarded. Uses ``_dc_orig``
+    when present; otherwise ``discharge_cycle``.
     """
     x_list: list[np.ndarray] = []
     y_list: list[float] = []
 
     dc_col = "_dc_orig" if "_dc_orig" in df.columns else "discharge_cycle"
+    # Rows i .. i+window_size-1 are inputs; label at row i + window_size + horizon (20-step lookahead).
     span = window_size + horizon
 
     for _, group in df.groupby("battery_id", sort=True):
@@ -81,14 +110,16 @@ def create_sequences(
         if len(g) < span + 1:
             continue
         for i in range(len(g) - span):
-            path_dc = dc[i : i + span + 1]
+            label_idx = i + window_size + horizon
+            # Contiguous discharge_cycle from first window row through label row (strict > 1 => discard).
+            path_dc = dc[i : label_idx + 1]
             if path_dc.size != span + 1:
                 continue
-            if np.any(np.diff(path_dc) > 1):
+            if np.any(np.diff(path_dc) > 1.0):
                 continue
             j = i + window_size
             x_list.append(x[i:j])
-            y_list.append(float(y[i + span]))
+            y_list.append(float(y[label_idx]))
 
     if not x_list:
         return (
@@ -100,12 +131,18 @@ def create_sequences(
 
 
 class LSTMRegressor(nn.Module):
+    """
+    Two-layer LSTM regressor with dropout (Phase 22): ``hidden_size=64``, ``num_layers=2``,
+    ``dropout=0.2`` between stacked LSTM layers. A linear readout maps the last hidden state to SoH
+    (scaled target space during training).
+    """
+
     def __init__(
         self,
-        input_size: int = 9,
-        hidden_size: int = 64,
-        num_layers: int = 2,
-        dropout: float = 0.2,
+        input_size: int,
+        hidden_size: int = LSTM_HIDDEN_SIZE,
+        num_layers: int = LSTM_NUM_LAYERS,
+        dropout: float = LSTM_DROPOUT,
     ) -> None:
         super().__init__()
         self.lstm = nn.LSTM(
@@ -133,6 +170,10 @@ def _run_epoch(
     train_mode = optimizer is not None
     if train_mode:
         model.train()
+        # Frozen LSTM + training fc: keep LSTM in eval so inter-layer dropout stays off.
+        lstm_has_grad = any(p.requires_grad for p in model.lstm.parameters())
+        if not lstm_has_grad:
+            model.lstm.eval()
     else:
         model.eval()
     total_loss = 0.0
@@ -163,8 +204,9 @@ def main() -> None:
     oxford_ids = sorted(oxford_df["battery_id"].dropna().unique().tolist())
     if len(oxford_ids) < 3:
         raise RuntimeError("Need at least 3 Oxford batteries for 2-shot adaptation + held-out test.")
+    adapt_ids = _oxford_adaptation_battery_ids(oxford_df, k=2)
     min_soh_by_cell = oxford_df.groupby("battery_id", sort=False)["soh_percentage"].min()
-    adapt_ids = min_soh_by_cell.nsmallest(2).index.astype(str).tolist()
+    adapt_min_soh = {bid: float(min_soh_by_cell[bid]) for bid in adapt_ids}
 
     df_train = pd.concat(
         [
@@ -198,7 +240,9 @@ def main() -> None:
     df_test.loc[:, [TARGET_COLUMN]] = target_scaler.transform(df_test[[TARGET_COLUMN]])
 
     src_tr = df_train["dataset_source"].astype(str).str.upper()
+    # Phase 1 pool: NASA + WARWICK only (no Oxford in pre-training).
     df_pretrain = df_train[src_tr.isin(("NASA", "WARWICK"))].copy()
+    # Phase 2 pool: few-shot Oxford adaptation cells only.
     df_finetune = df_train[(src_tr == "OXFORD") & (df_train["battery_id"].isin(adapt_ids))].copy()
 
     X_pre_np, y_pre_np = create_sequences(df_pretrain, window_size=WINDOW_SIZE)
@@ -223,21 +267,33 @@ def main() -> None:
     ft_loader = DataLoader(TensorDataset(X_ft, y_ft), batch_size=BATCH_SIZE, shuffle=True)
 
     input_size = len(FEATURE_COLUMNS)
-    model = LSTMRegressor(input_size=input_size, hidden_size=64, num_layers=2, dropout=0.2)
+    model = LSTMRegressor(
+        input_size=input_size,
+        hidden_size=LSTM_HIDDEN_SIZE,
+        num_layers=LSTM_NUM_LAYERS,
+        dropout=LSTM_DROPOUT,
+    )
     criterion = nn.MSELoss()
+
+    # --- Phase 1: pre-train full model on NASA + Warwick ---
     optimizer_pre = torch.optim.Adam(model.parameters(), lr=PRETRAIN_LR)
 
-    print(f"Pre-training on NASA + Warwick only: {len(y_pre_np)} sequences, {PRETRAIN_EPOCHS} epochs")
+    print(f"Phase 1 — pre-train (NASA + Warwick only): {len(y_pre_np)} sequences, {PRETRAIN_EPOCHS} epochs, lr={PRETRAIN_LR}")
     for epoch in range(PRETRAIN_EPOCHS):
         avg_loss = _run_epoch(model, pre_loader, criterion, optimizer_pre)
         if epoch == 0 or (epoch + 1) % 30 == 0:
             print(f"  Pre-train epoch {epoch + 1:03d}/{PRETRAIN_EPOCHS} - loss: {avg_loss:.4f}")
 
+    # --- Phase 2: fine-tune readout on 2 Oxford adaptation cells; LSTM frozen ---
     for p in model.lstm.parameters():
         p.requires_grad = False
+    model.lstm.eval()
     optimizer_ft = torch.optim.Adam(model.fc.parameters(), lr=FINETUNE_LR)
 
-    print(f"\nFine-tuning (frozen LSTM, head only) on Oxford adaptation cells: {len(y_ft_np)} sequences")
+    print(
+        f"\nPhase 2 — fine-tune (frozen LSTM, train fc only): {len(y_ft_np)} sequences, "
+        f"{FINETUNE_EPOCHS} epochs, lr={FINETUNE_LR}"
+    )
     for epoch in range(FINETUNE_EPOCHS):
         avg_loss = _run_epoch(model, ft_loader, criterion, optimizer_ft)
         if epoch == 0 or (epoch + 1) % 10 == 0:
@@ -263,7 +319,7 @@ def main() -> None:
     r2 = float(r2_score(y_true, y_pred))
 
     print("\nLSTM transfer learning: pre-train NASA+Warwick -> fine-tune 2 Oxford -> test held-out Oxford")
-    print(f"  Oxford adaptation batteries: {adapt_ids}")
+    print(f"  Oxford adaptation batteries (lowest min SoH): {adapt_ids}  min SoH: {adapt_min_soh}")
     print(
         f"  Pre-train sequences: {len(y_pre_np)} | Fine-tune sequences: {len(y_ft_np)} | "
         f"Test sequences: {len(y_test_np)}"

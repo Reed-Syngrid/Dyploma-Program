@@ -145,19 +145,32 @@ def _finite_array_from_field(data_struct: np.void, field: str) -> np.ndarray | N
     return arr
 
 
-def _temperature_variance_discharge(data_struct: np.void) -> float | None:
+def _scalar_spread(arr: np.ndarray | None) -> float:
+    """
+    Spread metric for a 1D array: sample variance if available, else max-min delta.
+    Missing / empty input -> NaN (caller keeps the discharge row).
+    """
+    if arr is None or arr.size == 0:
+        return float(np.nan)
+    if arr.size == 1:
+        return 0.0
+    v = float(np.var(arr))
+    if np.isfinite(v):
+        return v
+    return float(np.ptp(arr)) if np.isfinite(np.ptp(arr)) else float(np.nan)
+
+
+def _temperature_variance_discharge(data_struct: np.void) -> float:
     arr = _finite_array_from_field(data_struct, "Temperature_measured")
-    if arr is None:
-        return None
-    return float(np.var(arr))
+    return _scalar_spread(arr)
 
 
-def _voltage_variance_discharge(data_struct: np.void) -> float | None:
+def _voltage_variance_discharge(data_struct: np.void) -> float:
     for field in ("Voltage_measured", "Voltage"):
         arr = _finite_array_from_field(data_struct, field)
-        if arr is not None:
-            return float(np.var(arr))
-    return None
+        if arr is not None and arr.size > 0:
+            return _scalar_spread(arr)
+    return float(np.nan)
 
 
 def _unwrap_to_float_array(obj: object) -> np.ndarray | None:
@@ -264,13 +277,11 @@ class NASABatteryParser:
 
                 cap = _extract_discharge_capacity_ah(ds)
                 avg_temp = _extract_temperature_mean_c(ds)
-                tv = _temperature_variance_discharge(ds)
-                vv = _voltage_variance_discharge(ds)
+                temp_variance = _temperature_variance_discharge(ds)
+                voltage_variance = _voltage_variance_discharge(ds)
                 if cap is None or avg_temp is None:
                     continue
                 if not np.isfinite(cap) or not np.isfinite(avg_temp):
-                    continue
-                if tv is None or vv is None or not np.isfinite(tv) or not np.isfinite(vv):
                     continue
 
                 discharge_counter += 1
@@ -282,8 +293,8 @@ class NASABatteryParser:
                         "avg_temperature_c": avg_temp,
                         "internal_resistance_ohm": current_resistance,
                         "capacity_ah": cap,
-                        "temp_variance": tv,
-                        "voltage_variance": vv,
+                        "temp_variance": temp_variance,
+                        "voltage_variance": voltage_variance,
                         "soh_percentage": soh,
                     }
                 )

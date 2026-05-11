@@ -169,10 +169,22 @@ class OxfordBatteryParser:
                     if not np.isfinite(internal_resistance_ohm):
                         continue
                     soh_percentage = (capacity_ah / NOMINAL_CAPACITY_AH) * 100.0
-                    temp_variance = float(np.var(T_arr))
-                    voltage_variance = float(np.var(v))
-                    if not np.isfinite(temp_variance) or not np.isfinite(voltage_variance):
-                        continue
+                    t_fin = T_arr[np.isfinite(T_arr)]
+                    v_fin = v[np.isfinite(v)]
+                    if t_fin.size == 0:
+                        temp_variance = float(np.nan)
+                    elif t_fin.size == 1:
+                        temp_variance = 0.0
+                    else:
+                        tv = float(np.var(t_fin))
+                        temp_variance = tv if np.isfinite(tv) else float(np.ptp(t_fin))
+                    if v_fin.size == 0:
+                        voltage_variance = float(np.nan)
+                    elif v_fin.size == 1:
+                        voltage_variance = 0.0
+                    else:
+                        vv = float(np.var(v_fin))
+                        voltage_variance = vv if np.isfinite(vv) else float(np.ptp(v_fin))
                     rows.append(
                         {
                             "battery_id": battery_id,

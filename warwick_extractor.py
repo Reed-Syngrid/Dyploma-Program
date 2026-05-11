@@ -217,12 +217,20 @@ def _rows_from_discharge_segments(
         v_arr = vv_ser.to_numpy(dtype=np.float64)
         t_arr = t_arr[np.isfinite(t_arr)]
         v_arr = v_arr[np.isfinite(v_arr)]
-        if t_arr.size == 0 or v_arr.size == 0:
-            continue
-        temp_variance = float(np.var(t_arr))
-        voltage_variance = float(np.var(v_arr))
-        if not np.isfinite(temp_variance) or not np.isfinite(voltage_variance):
-            continue
+        if t_arr.size == 0:
+            temp_variance = float(np.nan)
+        elif t_arr.size == 1:
+            temp_variance = 0.0
+        else:
+            tv = float(np.var(t_arr))
+            temp_variance = tv if np.isfinite(tv) else float(np.ptp(t_arr))
+        if v_arr.size == 0:
+            voltage_variance = float(np.nan)
+        elif v_arr.size == 1:
+            voltage_variance = 0.0
+        else:
+            vv = float(np.var(v_arr))
+            voltage_variance = vv if np.isfinite(vv) else float(np.ptp(v_arr))
 
         ir = _internal_resistance_ohm(seg, vcol, icol)
         soh = (cap / NOMINAL_CAPACITY_META_AH) * 100.0
