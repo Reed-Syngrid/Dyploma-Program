@@ -1,6 +1,12 @@
-OXFORD_RAW/
-NASA_RAW/
-WARWICK_RAW/
-output/
-*.png
-__pycache__/
+# Generic IDE & OS Metadata
+.*
+!/.gitignore
+!/.github/
+
+# Temporary & Log Files
+*.log
+*.tmp
+*.bak
+pycache/
+build/
+dist/
